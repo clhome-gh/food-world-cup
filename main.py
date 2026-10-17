@@ -1,5 +1,7 @@
 import random
 import uuid
+import pandas as pd
+import plotly.express as px
 import streamlit as st
 from supabase import create_client, Client
 
@@ -67,13 +69,11 @@ def save_duel(
             "right_menu": right_menu,
             "winner": winner,
         }
-        # Save to menu_duels table in public schema
         response = supabase.table("menu_duels").insert(data).execute()
-        # Verify insertion
         if response.data and len(response.data) > 0:
             return True
         return False
-    except Exception as e:
+    except Exception:
         return False
 
 
@@ -82,7 +82,6 @@ def select_winner(selected: str, left: str, right: str):
     if left == right:
         return
 
-    # Try saving to Supabase
     success = save_duel(
         game_id=st.session_state.game_id,
         round_name=st.session_state.current_round_name,
@@ -95,19 +94,15 @@ def select_winner(selected: str, left: str, right: str):
         st.session_state.db_error = True
         return
 
-    # Advance to next match/round
     st.session_state.next_candidates.append(selected)
     st.session_state.match_index += 1
 
-    # Check if current round completed
     if st.session_state.match_index * 2 >= len(
         st.session_state.current_candidates
     ):
         if len(st.session_state.next_candidates) == 1:
-            # Tournament Finished
             st.session_state.winner = st.session_state.next_candidates[0]
         else:
-            # Next Round setup
             if len(st.session_state.next_candidates) == 4:
                 st.session_state.current_round_name = "4강"
             elif len(st.session_state.next_candidates) == 2:
@@ -120,11 +115,148 @@ def select_winner(selected: str, left: str, right: str):
             st.session_state.match_index = 0
 
 
-# UI Layout
+# Fetch Analysis Data from Supabase
+def fetch_analysis_data():
+    try:
+        # Select id, game_id, round, left_menu, right_menu, winner columns
+        res = (
+            supabase.table("menu_duels")
+            .select("id, game_id, round, left_menu, right_menu, winner")
+            .execute()
+        )
+        data = res.data
+        return data, None
+    except Exception as e:
+        return None, str(e)
+
+
+# Render Analytics View
+def render_analytics():
+    st.markdown("---")
+    st.header("📊 학급 전체 대결 기록 분석")
+
+    if st.button("🔄 분석 결과 다시 불러오기"):
+        st.cache_data.clear()
+        st.rerun()
+
+    data, error = fetch_analysis_data()
+
+    if error:
+        st.error(f"🚨 기록을 불러오는 중 오류가 발생했습니다: {error}")
+        return
+
+    if not data or len(data) == 0:
+        st.info("ℹ️ 아직 저장된 대결 기록이 없습니다. 월드컵에 참여해 보세요!")
+        return
+
+    total_records = len(data)
+    game_ids = set(row["game_id"] for row in data if row.get("game_id"))
+    total_games = len(game_ids)
+
+    st.caption(
+        f"💡 **집계 안내**: 총 **{total_records}건**의 대결 기록과 **{total_games}개**의 판(게임)을 바탕으로 분석했습니다. "
+        "기록 수와 실제 참여 인원은 다를 수 있으며, 진행 중에 남긴 대결 기록도 포함되어 있습니다."
+    )
+
+    # Initialize stats dictionary for all candidates
+    stats = {
+        menu: {"duels": 0, "wins": 0, "championships": 0} for menu in CANDIDATES
+    }
+
+    for row in data:
+        left = row.get("left_menu")
+        right = row.get("right_menu")
+        winner = row.get("winner")
+        round_name = row.get("round")
+
+        # Count duels for both left and right menu
+        if left in stats:
+            stats[left]["duels"] += 1
+        if right in stats:
+            stats[right]["duels"] += 1
+
+        # Count wins
+        if winner in stats:
+            stats[winner]["wins"] += 1
+
+        # Count championships (round == '결승')
+        if round_name == "결승" and winner in stats:
+            stats[winner]["championships"] += 1
+
+    # Format table data
+    table_rows = []
+    for menu in CANDIDATES:
+        duels = stats[menu]["duels"]
+        wins = stats[menu]["wins"]
+        championships = stats[menu]["championships"]
+
+        if duels > 0:
+            win_rate_val = (wins / duels) * 100
+            win_rate_str = f"{win_rate_val:.1f}%"
+        else:
+            win_rate_val = -1.0
+            win_rate_str = "아직 알 수 없음"
+
+        table_rows.append(
+            {
+                "반찬": menu,
+                "대결 수": duels,
+                "승리 수": wins,
+                "승률 (%)": win_rate_str,
+                "우승 횟수": championships,
+                "win_rate_val": win_rate_val,
+            }
+        )
+
+    df = pd.DataFrame(table_rows)
+
+    # Sort table by win rate descending, then duels, then wins
+    df_sorted = df.sort_values(
+        by=["win_rate_val", "대결 수", "승리 수"], ascending=[False, False, False]
+    ).reset_index(drop=True)
+
+    # Display Table
+    st.subheader("📋 반찬별 승률 및 대결 요약")
+    display_df = df_sorted[
+        ["반찬", "대결 수", "승리 수", "승률 (%)", "우승 횟수"]
+    ]
+    st.dataframe(display_df, use_container_width=True)
+
+    # Plotly Horizontal Bar Chart
+    st.subheader("📈 반찬별 승률 비교")
+
+    # Filter candidates with available win rate for chart
+    chart_df = df_sorted[df_sorted["win_rate_val"] >= 0].copy()
+
+    if not chart_df.empty:
+        # Sort ascending for plotly horizontal bar chart (top displayed highest)
+        chart_df = chart_df.sort_values(
+            by="win_rate_val", ascending=True
+        ).reset_index(drop=True)
+
+        fig = px.bar(
+            chart_df,
+            x="win_rate_val",
+            y="반찬",
+            orientation="h",
+            labels={"win_rate_val": "승률 (%)", "반찬": "반찬 이름"},
+            text=chart_df["win_rate_val"].apply(lambda v: f"{v:.1f}%"),
+            title="반찬별 승률 (%)",
+        )
+        fig.update_traces(
+            textposition="auto", marker_color="#FF4B4B", hovertemplate="%{y}: %{x:.1f}%"
+        )
+        fig.update_layout(xaxis_range=[0, 100], yaxis={"categoryorder": "value ascending"})
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("비교할 대결 기록이 부족하여 그래프를 표시하지 않습니다.")
+
+
+# App Layout Header
 st.title("🍱 급식 월드컵 🏆")
 st.write("최애 급식 반찬을 골라주세요!")
 
-# Error state check
+# Error State
 if st.session_state.get("db_error", False):
     st.error(
         "🚨 저장 결과를 확인하지 못했습니다. 대결 저장이 정상적으로 완료되었는지 확인이 필요합니다."
@@ -134,16 +266,19 @@ if st.session_state.get("db_error", False):
         init_game()
         st.rerun()
 
-# Winner state check
+# Winner State
 elif st.session_state.winner:
     st.balloons()
     st.header("🎉 우승 반찬 🎉")
     st.subheader(f"✨ {st.session_state.winner} ✨")
     st.write("축하합니다! 이번 월드컵의 최고의 반찬으로 선정되었습니다.")
-    st.markdown("---")
+
     if st.button("다시 시작하기", type="primary"):
         init_game()
         st.rerun()
+
+    # Show Analytics on Winner Screen
+    render_analytics()
 
 # Tournament Ongoing
 else:
@@ -160,7 +295,9 @@ else:
     with col1:
         st.info(left_menu)
         if st.button(
-            f"👍 {left_menu} 선택", key=f"btn_left_{match_idx}", use_container_width=True
+            f"👍 {left_menu} 선택",
+            key=f"btn_left_{match_idx}",
+            use_container_width=True,
         ):
             select_winner(left_menu, left_menu, right_menu)
             st.rerun()
@@ -174,3 +311,6 @@ else:
         ):
             select_winner(right_menu, left_menu, right_menu)
             st.rerun()
+
+    # Show Analytics below game on match screen
+    render_analytics()
